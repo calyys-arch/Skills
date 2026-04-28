@@ -1,253 +1,268 @@
 ---
 name: greycat-sdk-gcl-reference
-description: "GreyCat C API and GCL Standard Library reference. Use for: (1) Native C development with gc_machine_t context, tensors, objects, memory management, crypto, I/O; (2) GCL Standard Library modules - std::core (Date/Time/Tuple/geospatial types), std::runtime (Scheduler/Task/Logger/User/Security/System/OpenAPI/MCP), std::io (CSV/JSON/XML/HTTP/Email/FileWalker), std::util (Queue/Stack/SlidingWindow/Gaussian/Histogram/Quantizers/Random/Plot); (3) Plugin development patterns - lifecycle hooks, type configuration, nativegen, module-level and type-level function linking, global state, thread safety, conditional logging. Keywords: GreyCat, GCL, native functions, tensors, task automation, scheduler, plugin development, gc_machine_t, gc_slot_t."
+description: "GreyCat C API and GCL Standard Library reference. Use for: (1) Native C development with gc_machine_t context, tensors, objects, memory management, crypto, I/O; (2) GCL Standard Library modules - std::core (Date/Time/Tuple/geospatial types), std::runtime (Scheduler/Task/Logger/User/Security/System/OpenAPI/MCP), std::io (CSV/JSON/XML/HTTP/Email/FileWalker), std::util (Queue/Stack/SlidingWindow/Gaussian/Histogram/Quantizers/Random/Plot); (3) Plugin development patterns - lifecycle hooks, type configuration, nativegen, module-level and type-level function linking, global state, thread safety, conditional logging. Keywords: GreyCat, GCL, native functions, tensors, task automation, scheduler, plugin development."
 ---
 
-# GreyCat SDK & GCL Reference
+# GreyCat SDK - C API, Standard Library & Plugin Development
 
-Native C extension development and GCL application reference for the GreyCat ecosystem.
+Comprehensive reference for GreyCat native development (C API), the GCL Standard Library, and plugin development patterns. Tracks SDK **2.5.6**.
 
-## Core C API Primitives
+## Key Considerations (2.5.6)
 
-| Type | Purpose |
-|------|---------|
-| `gc_machine_t*` | Execution context — passed to every native function |
-| `gc_slot_t` | Tagged value container (holds any GCL value) |
-| `gc_type_t` | Type enum (int, float, bool, string, object, null…) |
-| `gc_object_t*` | Heap object handle |
+- **Allocator API migration** — the major change. Every allocation now takes an explicit `gc_allocator_t *`. See the "Memory management" block below; the old `gc_gnu_*` / `gc_global_gnu_*` families are gone, and `gc_malloc` / `gc_free` / `gc_realloc` are deprecated back-compat stubs.
+- Many collection init / string create functions gained a trailing `const gc_machine_t *ctx` (so they can reach the per-call allocator). Notable: `gc_array__init`, `gc_map__init`, `gc_table__init`, `gc_table__init_cols`, `gc_string__create_from`, `gc_string__create_concat`, `gc_string__create_from_or_symbol`, `gc_core_tensor__clone_internal`, `gc_sort__piposort`.
+- `gc_buffer__create(gc_allocator_t *)` now requires an allocator. `gc_buffer_t` gained an `allocator` field and `gc_buffer_options_t` lost its `global` flag.
+- New in `gc/host.h`: `gc_host__allocator`, `gc_host__scheduler`, and a full periodic-task scheduler API (`gc_scheduler_t`, `gc_periodic_task_t`, `gc_periodicity_t`, weekly/monthly/yearly configs).
+- `gc_program__create(abi, allocator)` is new; `gc_program__create_from_abi` now takes an allocator; `gc_program__create_object` and `gc_object__create` are no longer public — use `gc_machine__create_object` instead.
 
-### Native Function Signature
+## Contents
 
-```c
-void my_native_fn(gc_machine_t* m) {
-    // read params from stack, push result
-}
-```
-
-### Reading Parameters
-
-```c
-gc_slot_t* p0 = gc_machine_param(m, 0);   // first param
-gc_slot_t* p1 = gc_machine_param(m, 1);   // second param
-int64_t    v  = gc_slot_int(p0);           // extract int64
-double     f  = gc_slot_float(p0);         // extract float
-bool       b  = gc_slot_bool(p0);          // extract bool
-```
-
-### Returning Values
-
-```c
-gc_machine_return_int(m, 42);
-gc_machine_return_float(m, 3.14);
-gc_machine_return_bool(m, true);
-gc_machine_return_null(m);
-gc_machine_return_object(m, obj);
-```
-
-### Type Checking
-
-```c
-gc_type_t t = gc_slot_type(slot);
-if (t == GC_TYPE_INT)    { ... }
-if (t == GC_TYPE_FLOAT)  { ... }
-if (t == GC_TYPE_NULL)   { ... }
-if (t == GC_TYPE_STRING) { ... }
-```
-
-Full C API reference → [references/c-api.md](references/c-api.md)
+1. **C API** - Native function implementation, tensor operations, object manipulation, maps, arrays, tables, geospatial, time/date, crypto, buffers, I/O
+2. **Standard Library (std)** - GCL runtime features, I/O, collections, and utilities
+3. **Plugin Development** - Complete guide to building native plugins with lifecycle hooks, type configuration, and real-world patterns
 
 ---
 
-## Tensors
+# GreyCat C API
+
+## Core Concepts
+
+**gc_machine_t** - Execution context passed to all native functions. Use to get parameters, set results, report errors, create objects, and access scratch buffers.
+
+**gc_slot_t** - Universal value container (tagged union) holding any GreyCat value: integers, floats, bools, objects, enums, tuples, etc.
+
+**gc_type_t** - Type system enum (8-bit, 24 values) defining all GreyCat types: null, bool, char, int, float, node variants, geo, time, duration, cubic, static_field, object, block_ref, block_inline, function, undefined, type, field, stringlit, error.
+
+**gc_object_t** - Generic handle for heap-allocated objects. Packed to 128 bits. Every collection type (Array, Map, Table, Tensor, String, Buffer) starts with this as its first member.
+
+## Common Operations
+
+**Parameter handling:**
+```c
+gc_slot_t param = gc_machine__get_param(ctx, 0);        // 0-indexed
+gc_type_t type = gc_machine__get_param_type(ctx, 0);
+u32_t count = gc_machine__get_param_nb(ctx);
+gc_slot_t self = gc_machine__this(ctx);                  // 'this' for instance methods
+```
+
+**Enum parameter handling (CRITICAL — common source of bugs):**
+
+GCL enum values are **NOT** `gc_type_int`. They are `gc_type_static_field` and the ordinal is in `.tu32.right`, not `.i64`.
 
 ```c
-// Create tensor
-gc_object_t* tensor = gc_tensor_new(m, GC_TYPE_FLOAT, rank, dims);
+// WRONG — enum will always hit the default fallback:
+i64_t variant = (gc_machine__get_param_type(ctx, 0) == gc_type_int) ? slot.i64 : 0;
 
-// Access element at indices [i][j]
-size_t idx[] = { i, j };
-gc_slot_t* elem = gc_tensor_at(m, tensor, idx);
-gc_slot_set_float(elem, 3.14);
-
-// Get tensor shape
-size_t rank  = gc_tensor_rank(tensor);
-size_t* dims = gc_tensor_dims(tensor);
+// CORRECT — reads the enum ordinal properly:
+i64_t variant = (gc_machine__get_param_type(ctx, 0) == gc_type_static_field) ? (i64_t)slot.tu32.right : 0;
 ```
+
+The `.tu32` field is a struct with `.left` (type offset, identifies the enum type) and `.right` (value offset / ordinal within the enum). For dispatch purposes you almost always want `.tu32.right`.
+
+**Setting results:**
+```c
+gc_machine__set_result(ctx, (gc_slot_t){.i64 = 42}, gc_type_int);
+gc_machine__set_result(ctx, (gc_slot_t){.f64 = 3.14}, gc_type_float);
+gc_machine__set_result(ctx, (gc_slot_t){.b = true}, gc_type_bool);
+gc_machine__set_result(ctx, (gc_slot_t){.object = obj}, gc_type_object);
+gc_object__un_mark(obj, ctx);  // CRITICAL for objects -- prevents premature GC
+// Returning an enum value (e.g., MyEnum::variant2 where variant2 is ordinal 1):
+gc_machine__set_result(ctx, (gc_slot_t){.tu32 = {.left = 0, .right = 1}}, gc_type_static_field);
+```
+
+**Error handling:**
+```c
+gc_machine__set_runtime_error(ctx, "Something failed");
+gc_machine__set_runtime_error_syserr(ctx);  // Uses errno
+if (gc_machine__error(ctx)) return;         // Check propagated errors
+```
+
+**Object field access:**
+```c
+gc_slot_t value = gc_object__get_at(obj, field_offset, &type, ctx);
+gc_object__set_at(obj, field_offset, value, value_type, ctx);
+gc_object__declare_dirty(obj);  // Mark modified for persistence write-back
+```
+
+**Object creation:**
+```c
+gc_object_t *obj = gc_machine__create_object(ctx, gc_core_Map);
+gc_object_t *ret = gc_machine__create_return_type_object(ctx);
+```
+
+**Tensor operations:**
+```c
+gc_core_tensor_t *t = gc_core_tensor__create(ctx);
+gc_core_tensor__init_2d(t, rows, cols, gc_core_TensorType_f32, ctx);
+f32_t val = gc_core_tensor__get_2d_f32(t, row, col, ctx);
+gc_core_tensor__set_2d_f32(t, row, col, 3.14f, ctx);
+f64_t *raw = (f64_t *)gc_core_tensor__get_data(t);  // Direct memory access
+```
+
+**Array operations:**
+```c
+gc_array_t *arr = (gc_array_t *)gc_machine__create_object(ctx, gc_core_Array);
+gc_array__add_slot(arr, (gc_slot_t){.i64 = 42}, gc_type_int, ctx);
+gc_array__get_slot(arr, 0, &value, &type);
+gc_array__set_slot(arr, 0, value, type, ctx);
+```
+
+**Map operations:**
+```c
+gc_map_t *map = (gc_map_t *)gc_machine__create_object(ctx, gc_core_Map);
+gc_map__set(map, key, key_type, value, value_type, ctx);
+gc_slot_t val = gc_map__get(map, key, key_type, &val_type, prog);
+bool found = gc_map__contains(map, key, key_type, prog);
+```
+
+**String operations:**
+```c
+gc_string_t *s = gc_string__create_from(data, len, ctx);  // ctx required in 2.5.6
+gc_string_t *s2 = gc_string__create_concat(buf1, len1, buf2, len2, ctx);
+// Note: gc_string_t.buffer is NOT null-terminated. Use .size for length.
+```
+
+**Memory management (2.5.6 — allocator-first API):**
+
+| Allocator | Lifecycle | When to use |
+|-----------|-----------|-------------|
+| `((gc_ctx_t *)ctx)->allocator` | Per-native-call; reclaimed when the call ends | Default for everything inside a native: scratch buffers, intermediate arrays, per-call result strings. |
+| `gc_host__allocator(gc_host__get_global())` | Plugin-global, persists across threads and calls | `lib_start` / `lib_stop` state, global caches, precomputed lookup tables. Protect with your own mutex if shared across workers. |
+
+```c
+// Per-call scratch (default):
+gc_allocator_t *a = ((gc_ctx_t *)ctx)->allocator;
+char *temp = (char *)gc_alloc__malloc(a, size);
+// ... use temp ...
+gc_alloc__free(a, temp, size);
+
+// Plugin-global (cache once in lib_start):
+static gc_allocator_t *g_alloc;    // = gc_host__allocator(gc_host__get_global());
+double *shared = (double *)gc_alloc__malloc(g_alloc, size);
+gc_alloc__free(g_alloc, shared, size);
+
+// Reusable scratch buffer owned by the machine (no manual free):
+gc_buffer_t *buf = gc_machine__get_buffer(ctx);
+```
+
+> Every allocation in 2.5.6 must pass an explicit `gc_allocator_t *`. The previous `gc_gnu_malloc` / `gc_global_gnu_malloc` families are gone. `gc_malloc` / `gc_free` / `gc_realloc` remain exported for back-compat only; do not use them.
+
+**Buffer building:**
+```c
+gc_buffer_t *buf = gc_machine__get_buffer(ctx);
+gc_buffer__clear(buf);
+gc_buffer__add_cstr(buf, "prefix_");
+gc_buffer__add_u64(buf, 42);
+gc_buffer__prepare(buf, needed_bytes);  // Ensure capacity
+```
+
+**Program introspection:**
+```c
+const gc_program_t *prog = gc_machine__program(ctx);
+u32_t sym = gc_program__resolve_symbol(prog, "name", 4);
+u32_t mod = gc_program__resolve_module(prog, sym);
+u32_t type_id = gc_program__resolve_type(prog, mod, type_sym);
+```
+
+## Detailed Reference
+
+**File:** [references/api_reference.md](references/api_reference.md)
+
+**Load when implementing:**
+- Native C functions with gc_machine_t
+- Tensor operations (multi-dimensional arrays, complex numbers c64/c128)
+- Object/field manipulation, type introspection, GC mark/unmark
+- Map, Array, Table operations
+- Buffer building, binary read/write (varint, zig-zag encoding)
+- String operations (heap strings, inline short strings)
+- Node resolution (gc_node__resolve, gc_node__parse)
+- Geospatial (geohashing, Haversine distance), Time/Date/Timezone (formatting with gc_dtz_time__print/parse)
+- Cryptography (SHA-256, HMAC-SHA-256, Base64, Base64URL)
+- I/O operations (file open/sync)
+- Memory allocation (per-worker, global, aligned)
+- Program/Type System, ABI, symbol resolution
+- Host/Task management (spawn, cancel, status), periodic scheduler (gc_scheduler_t, gc_periodic_task_t), plugin-global allocator (gc_host__allocator)
+- Block storage (attach/detach objects)
+- Utility (Morton codes, parsing, sorting, licensing)
 
 ---
 
-## Object Manipulation
+# GreyCat Standard Library (std)
 
-```c
-// Create object of registered type
-gc_object_t* obj = gc_object_new(m, type_id);
+## Module Organization
 
-// Get/set fields
-gc_slot_t* field = gc_object_field(obj, field_idx);
-gc_slot_set_int(field, 100);
+- **std::core** - Fundamental types (Date, Time, Duration, Tuple, Error, geospatial types, enumerations)
+- **std::runtime** - Scheduler, Task, Job, Logger, User/Security, System, ChildProcess, License, OpenAPI, MCP
+- **std::io** - Text/Binary I/O, CSV, JSON, XML, HTTP client, Email/SMTP, FileWalker
+- **std::util** - Collections (Queue, Stack, SlidingWindow, TimeWindow), Statistics (Gaussian, Histogram), Quantizers, Assert, ProgressTracker, Crypto, Random, Plot
 
-// Read string value
-const char* str = gc_slot_string(slot);
-size_t      len = gc_slot_string_len(slot);
-```
+## Detailed Reference
 
----
+**File:** [references/standard_library.md](references/standard_library.md)
 
-## Memory & Scratch Buffers
-
-```c
-// Scratch buffer (freed after native call returns)
-void* buf = gc_machine_scratch(m, byte_size);
-
-// GC-managed allocation (do NOT free manually)
-void* mem = gc_machine_alloc(m, byte_size);
-```
-
-**CRITICAL**: Never `free()` GC-managed memory. Scratch buffers are invalidated when the native call returns.
+**Load when working with:**
+- Task scheduling and automation (Scheduler with periodicities)
+- File I/O operations (CSV, JSON, XML, binary files)
+- HTTP integration and REST APIs
+- Statistical analysis and data processing
+- Security, authentication, and user management
+- System operations and logging
 
 ---
 
-## GCL Standard Library Quick Reference
+# Plugin Development Guide
 
-### std::core
+## Overview
 
-| Type | Description |
-|------|-------------|
-| `Date` | Calendar date with timezone support |
-| `Time` (alias: `time`) | Microsecond-precision timestamp |
-| `Duration` (alias: `duration`) | Time span |
-| `Tuple<A,B>` | Immutable pair |
-| `geo` | WGS-84 coordinate `geo{lat, lng}` |
-| `GeoBox`, `GeoCircle`, `GeoPoly` | Geospatial shapes |
+Build native GreyCat plugins in C with proper lifecycle management, type configuration, and thread safety.
 
-### std::runtime
+## Key Patterns
 
-| Symbol | Purpose |
-|--------|---------|
-| `Scheduler` | Cron-style task scheduling |
-| `Task<T>` | Async job (see parallelisation) |
-| `Logger` | Structured log output |
-| `User` / `Role` | Authentication & authorisation |
-| `Security` | Password hashing, JWT |
-| `System` | OS-level ops (env, exec, signal) |
-| `OpenAPI` | Expose endpoints as OpenAPI spec |
-| `MCP` | Expose endpoints as MCP tools |
+**Function naming (CRITICAL — must match nativegen):** `gc_<module>_<Type>__<method>(gc_machine_t *ctx)`
 
-**Scheduler example (GCL)**:
-```gcl
-@expose
-fn startScheduler() {
-    Scheduler::schedule("0 * * * *", fn() { processHourly(); });
-}
+When GreyCat compiles GCL code with `native` function declarations, it auto-generates `nativegen.c` and `nativegen.h` files. The nativegen `extern` declarations define the **exact C symbol names** the runtime will look for at dlopen time. Your C function definitions **MUST** use these exact names or you'll get `undefined symbol` errors.
+
+**Naming convention:**
+- Type method: `gc_<module>_<Type>__<method>` (double underscore before method)
+- Module function: `gc_<module>__<fn>` (double underscore before function)
+- The `<module>` comes from the GCL file's module path (e.g., `text_normalizer` for a file in the `text_normalizer/` module)
+- The `<Type>` matches the GCL type name exactly (PascalCase)
+- The `<method>` matches the GCL method name exactly (camelCase)
+
+**Example mapping (GCL → C):**
+```
+// GCL (in module "text_normalizer", type TextNormalizer):
+//   native static fn rejoinHyphenatedWords(text: String): String;
+//
+// nativegen.h generates:
+//   extern void gc_text_normalizer_TextNormalizer__rejoinHyphenatedWords(gc_machine_t *ctx);
+//
+// Your C implementation MUST be named:
+void gc_text_normalizer_TextNormalizer__rejoinHyphenatedWords(gc_machine_t *ctx) { ... }
 ```
 
-### std::io
+**Plugin lifecycle:** `link -> lib_start -> [worker_start -> native calls -> worker_stop] -> lib_stop`
 
-| Symbol | Purpose |
-|--------|---------|
-| `CsvReader` / `CsvWriter` | Typed CSV parsing/emission |
-| `JsonReader` / `JsonWriter` | JSON I/O |
-| `XmlReader` | XML parsing |
-| `HttpClient` | Outbound HTTP requests |
-| `Email` | SMTP send |
-| `FileWalker` | Recursive directory traversal |
+**Type configuration:** `gc_program_type__configure(prog, type_id, sizeof(my_struct_t), finalizer)`
 
-**HTTP example (GCL)**:
-```gcl
-var res = HttpClient::get("https://api.example.com/data", null);
-var body = res.text();
-```
-
-### std::util
-
-| Symbol | Purpose |
-|--------|---------|
-| `Queue<T>` / `Stack<T>` | In-memory FIFO/LIFO |
-| `SlidingWindow<T>` | Rolling aggregation |
-| `Gaussian` | Normal distribution stats |
-| `Histogram` | Bucketed frequency counts |
-| `Quantizer` | Online quantile estimation |
-| `Random` | Seeded PRNG — `Random{}.uniform(min,max)` |
-| `Plot` | Simple chart data structures |
-
-Full standard library reference → [references/std-library.md](references/std-library.md)
-
----
-
-## Plugin Development
-
-### Lifecycle Hooks
-
+**Library hooks:**
 ```c
-// Called once at plugin load
-void gc_plugin_init(gc_machine_t* m) { }
-
-// Called once at plugin unload
-void gc_plugin_destroy(gc_machine_t* m) { }
+gc_program_library__set_lib_hooks(lib, lib_start, lib_stop);
+gc_program_library__set_worker_hooks(lib, worker_start, worker_stop);
 ```
 
-### Registering Native Functions
+## Detailed Reference
 
-```c
-// In plugin init — link GCL function name to C function
-gc_plugin_register_fn(m, "myModule::myFn", my_native_fn, param_count);
-```
+**File:** [references/plugin_development.md](references/plugin_development.md)
 
-### Type-Level Functions (methods)
-
-```c
-// Register as method on a GCL type
-gc_plugin_register_type_fn(m, type_id, "methodName", my_method_fn);
-```
-
-### nativegen Pattern
-
-Use `greycat codegen c` to generate C header stubs from `.gcl` type definitions, then implement each stub:
-
-```bash
-greycat codegen c --out native/gen/
-```
-
-### Global State & Thread Safety
-
-```c
-// Store per-plugin state
-static MyState* g_state = NULL;
-
-void gc_plugin_init(gc_machine_t* m) {
-    g_state = calloc(1, sizeof(MyState));
-    gc_plugin_set_userdata(m, g_state);
-}
-// ALWAYS protect shared state with a mutex — GCL workers run in parallel
-```
-
-### Conditional Logging
-
-```c
-if (gc_machine_log_enabled(m, GC_LOG_DEBUG)) {
-    gc_machine_log(m, GC_LOG_DEBUG, "value=%ld", val);
-}
-```
-
-Full plugin patterns → [references/plugin-dev.md](references/plugin-dev.md)
-
----
-
-## Common Pitfalls
-
-| Wrong | Correct |
-|-------|---------|
-| `free(gc_alloc'd ptr)` | Never free GC memory manually |
-| Reading scratch buf after return | Scratch is invalidated on return |
-| Missing null check on `gc_slot_string()` | Always check `GC_TYPE_NULL` first |
-| Using non-thread-safe globals | Protect with mutex |
-| `gc_slot_int` on a float slot | Check type with `gc_slot_type()` first |
-| Registering fn with wrong param count | Must match GCL declaration exactly |
-
----
-
-## Resources
-
-- **Docs**: https://doc.greycat.io/
-- **Downloads / versions**: https://get.greycat.io/
-- **GCL language syntax**: see the `greycat` skill (`.gcl` files, nodes, types)
+**Load when:**
+- Building a new native plugin from scratch
+- Setting up CMake build configuration for .gclib output
+- Implementing nativegen.c/h (symbol resolution, type/function linking)
+- Linking module-level native functions (gc_program__link_mod_fn) or type methods (gc_program__link_type_fn)
+- Managing library/worker lifecycle hooks
+- Wrapping C library handles in GreyCat objects (boxing pattern)
+- Implementing thread-safe global state with mutexes
+- Mapping GCL enums to C library enums
+- Using the buffer reuse and tokenization retry patterns
+- Implementing conditional logging with gc_machine__log_level
